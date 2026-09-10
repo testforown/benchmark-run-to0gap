@@ -1,0 +1,65 @@
+name: opencode-review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Configure modelhub provider
+        env:
+          MODELHUB_BASE_URL: ${{ vars.OPENAI_BASE_URL }}
+          MODELHUB_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          MODELHUB_MODEL: ${{ vars.OPENAI_MODEL }}
+        run: |
+          cat > opencode.json <<JSON
+          {
+            "$schema": "https://opencode.ai/config.json",
+            "permission": {"bash": "allow", "edit": "allow", "write": "allow", "read": "allow"},
+            "provider": {
+              "modelhub": {
+                "npm": "@ai-sdk/openai-compatible",
+                "name": "modelhub",
+                "options": {"baseURL": "${MODELHUB_BASE_URL}", "apiKey": "${MODELHUB_API_KEY}"},
+                "models": {"${MODELHUB_MODEL}": {}}
+              }
+            }
+          }
+          JSON
+      - name: Install opencode
+        run: npm install -g opencode-ai@1.18.29
+      - name: Probe modelhub connectivity
+        env:
+          MODELHUB_BASE_URL: ${{ vars.OPENAI_BASE_URL }}
+          MODELHUB_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          MODELHUB_MODEL: ${{ vars.OPENAI_MODEL }}
+        run: |
+          echo "== probe chat/completions =="
+          curl -s -o /tmp/probe.json -w "http=%{http_code} time=%{time_total}s\n" \
+            -X POST "${MODELHUB_BASE_URL}/chat/completions" \
+            -H "api-key: ${MODELHUB_API_KEY}" -H "Content-Type: application/json" \
+            -d "{\"model\":\"${MODELHUB_MODEL}\",\"messages\":[{\"role\":\"user\",\"content\":\"say hi\"}],\"max_tokens\":16}" || true
+          head -c 400 /tmp/probe.json; echo
+      - name: Run opencode review
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          GITHUB_TOKEN: ${{ github.token }}
+          MODELHUB_MODEL: ${{ vars.OPENAI_MODEL }}
+        run: |
+          PROMPT="Review this pull request:
+          - Check for code quality issues
+          - Look for potential bugs
+          - Suggest improvements"
+          timeout 600 opencode run --print-logs --log-level DEBUG --model "modelhub/${MODELHUB_MODEL}" "$PROMPT" > review.md 2> review.err || echo "opencode exit=$?"
+          echo "----- review.md (head) -----"; head -c 2000 review.md
+          echo "----- review.err (tail 120) -----"; tail -120 review.err
+          if [ -s review.md ]; then gh pr comment "${{ github.event.pull_request.number }}" --body-file review.md || true; fi
